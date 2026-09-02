@@ -1,184 +1,478 @@
+"""Create Jira releases for configured GitHub repositories."""
+
+from __future__ import annotations
+
+import logging
 import os
 import sys
+from pathlib import Path
+from typing import Any
+
 import requests
 import yaml
+from requests import Response
 from requests.auth import HTTPBasicAuth
 
+CONFIG_FILE = Path("jira-projects.yml")
+REQUEST_TIMEOUT = 30
+REPOSITORIES_KEY = "repositories"
 
-# --------------------------------------------------
-# GitHub release information
-# --------------------------------------------------
-
-version = os.environ["VERSION"]
-tag = os.environ["TAG"]
-environment = os.environ["ENVIRONMENT"]
-repository = os.environ["REPOSITORY"]
-workflow = os.environ["WORKFLOW"]
+LOGGER = logging.getLogger(__name__)
 
 
-# --------------------------------------------------
-# Jira configuration
-# --------------------------------------------------
+def required_env(name: str) -> str:
+    """Return a required environment variable."""
+    value = os.getenv(name, "").strip()
 
-jira_url = os.environ["JIRA_URL"].rstrip("/")
-jira_email = os.environ["JIRA_EMAIL"]
-jira_api_token = os.environ["JIRA_API_TOKEN"]
-
-
-# --------------------------------------------------
-# Read central Jira project configuration
-# --------------------------------------------------
-
-config_file = "jira-projects.yml"
-
-if not os.path.exists(config_file):
-    print(f"ERROR: {config_file} not found.")
-    sys.exit(1)
-
-with open(config_file, "r") as file:
-    config = yaml.safe_load(file)
-
-
-repositories = config.get("repositories", {})
-
-if repository not in repositories:
-    print(f"ERROR: Repository '{repository}' is not configured.")
-    sys.exit(1)
-
-
-jira_projects = repositories[repository].get("jira_projects", [])
-
-if not jira_projects:
-    print(f"ERROR: No Jira projects configured for '{repository}'.")
-    sys.exit(1)
-
-
-print("========================================")
-print("Release Configuration")
-print("========================================")
-print(f"Repository: {repository}")
-print(f"Version: {version}")
-print(f"Tag: {tag}")
-print(f"Environment: {environment}")
-print(f"Workflow: {workflow}")
-print(f"Jira Projects: {jira_projects}")
-print("========================================")
-
-
-# --------------------------------------------------
-# Jira Release description
-# --------------------------------------------------
-
-description = f"{version}_{tag}_{environment}_{repository}_{workflow}"
-
-print(f"Release description: {description}")
-
-
-# --------------------------------------------------
-# Jira authentication
-# --------------------------------------------------
-
-auth = HTTPBasicAuth(
-    jira_email,
-    jira_api_token
-)
-
-headers = {
-    "Accept": "application/json",
-    "Content-Type": "application/json"
-}
-
-
-# --------------------------------------------------
-# Create Release in each configured Jira project
-# --------------------------------------------------
-
-for project_key in jira_projects:
-
-    print("")
-    print("========================================")
-    print(f"Creating Release in Jira project: {project_key}")
-    print("========================================")
-
-    # Get Jira project
-    project_url = f"{jira_url}/rest/api/3/project/{project_key}"
-
-    project_response = requests.get(
-        project_url,
-        auth=auth,
-        headers=headers,
-        timeout=30
-    )
-
-    print(
-        f"Project lookup status for {project_key}: "
-        f"{project_response.status_code}"
-    )
-
-    if not project_response.ok:
-        print(
-            f"Failed to retrieve Jira project {project_key}."
+    if not value:
+        raise ValueError(
+            f"Required environment variable '{name}' is missing or empty."
         )
-        print(project_response.text)
-        sys.exit(1)
 
-    project = project_response.json()
-
-    project_id = project["id"]
-
-    print(f"Jira project: {project.get('name')}")
-    print(f"Jira project key: {project.get('key')}")
-    print(f"Jira project ID: {project_id}")
+    return value
 
 
-    # --------------------------------------------------
-    # Create Jira Release / Version
-    # --------------------------------------------------
-
-    payload = {
-        "name": version,
-        "description": description,
-        "projectId": int(project_id),
-        "released": False
-    }
-
-    version_url = f"{jira_url}/rest/api/3/version"
-
-    response = requests.post(
-        version_url,
-        json=payload,
-        auth=auth,
-        headers=headers,
-        timeout=30
+def load_environment() -> dict[str, str]:
+    """Load and validate application environment variables."""
+    names = (
+        "VERSION",
+        "TAG",
+        "ENVIRONMENT",
+        "REPOSITORY",
+        "WORKFLOW",
+        "JIRA_URL",
+        "JIRA_EMAIL",
+        "JIRA_API_TOKEN",
     )
 
-    print(
-        f"Jira Release creation status for "
-        f"{project_key}: {response.status_code}"
+    environment = {name: required_env(name) for name in names}
+    environment["JIRA_URL"] = environment["JIRA_URL"].rstrip("/")
+
+    return environment
+
+
+def load_configuration(path: Path) -> dict[str, Any]:
+    """Load and validate the Jira project configuration."""
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Configuration file '{path}' was not found."
+        )
+
+    with path.open(encoding="utf-8") as file:
+        config = yaml.safe_load(file)
+
+    if not isinstance(config, dict):
+        raise ValueError(
+            f"Configuration file '{path}' must contain a YAML mapping."
+        )
+
+    repositories = config.get(REPOSITORIES_KEY)
+
+    if not isinstance(repositories, dict):
+        raise ValueError(
+            f"'{REPOSITORIES_KEY}' must be a mapping in '{path}'."
+        )
+
+    return config
+
+
+def get_jira_projects(
+    config: dict[str, Any],
+    repository: str,
+) -> list[str]:
+    """Return Jira projects configured for a repository."""
+    repository_config = config[REPOSITORIES_KEY].get(repository)
+
+    if repository_config is None:
+        raise ValueError(
+            f"Repository '{repository}' is not configured."
+        )
+
+    if not isinstance(repository_config, dict):
+        raise ValueError(
+            f"Configuration for repository '{repository}' must be a mapping."
+        )
+
+    projects = repository_config.get("jira_projects", [])
+
+    if not isinstance(projects, list):
+        raise ValueError(
+            f"'jira_projects' for repository '{repository}' must be a list."
+        )
+
+    projects = [
+        str(project).strip()
+        for project in projects
+        if str(project).strip()
+    ]
+
+    if not projects:
+        raise ValueError(
+            f"No Jira projects configured for '{repository}'."
+        )
+
+    return projects
+
+
+def create_jira_session(
+    email: str,
+    token: str,
+) -> requests.Session:
+    """Create an authenticated Jira session."""
+    session = requests.Session()
+    session.auth = HTTPBasicAuth(email, token)
+    session.headers.update(
+        {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+    )
+
+    return session
+
+
+def jira_request(
+    session: requests.Session,
+    method: str,
+    url: str,
+    operation: str,
+    **kwargs: Any,
+) -> Response:
+    """Execute a Jira request."""
+    try:
+        response = session.request(
+            method,
+            url,
+            timeout=REQUEST_TIMEOUT,
+            **kwargs,
+        )
+    except requests.RequestException:
+        LOGGER.exception("%s failed.", operation)
+        raise
+
+    LOGGER.info(
+        "%s status: %s",
+        operation,
+        response.status_code,
+    )
+
+    return response
+
+
+def log_api_error(
+    response: Response,
+    operation: str,
+) -> None:
+    """Log details from a failed Jira API response."""
+    LOGGER.error(
+        "%s failed with HTTP status %s.",
+        operation,
+        response.status_code,
+    )
+
+    response_text = response.text.strip()
+
+    if response_text:
+        LOGGER.error(
+            "Jira API response: %s",
+            response_text,
+        )
+
+
+def json_object(
+    response: Response,
+    operation: str,
+) -> dict[str, Any]:
+    """Return a Jira response as a JSON object."""
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid JSON returned by {operation}."
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"Unexpected response returned by {operation}."
+        )
+
+    return data
+
+
+def get_jira_project(
+    session: requests.Session,
+    jira_url: str,
+    project_key: str,
+) -> dict[str, Any]:
+    """Retrieve a Jira project."""
+    operation = f"Jira project lookup for '{project_key}'"
+
+    response = jira_request(
+        session,
+        "GET",
+        f"{jira_url}/rest/api/3/project/{project_key}",
+        operation,
+    )
+
+    if not response.ok:
+        log_api_error(response, operation)
+        response.raise_for_status()
+
+    return json_object(response, operation)
+
+
+def is_duplicate_version(response: Response) -> bool:
+    """Return whether a response indicates an existing Jira version."""
+    if response.status_code != 400:
+        return False
+
+    response_text = response.text.lower()
+
+    return any(
+        indicator in response_text
+        for indicator in (
+            "already exists",
+            "version already exists",
+            "a version with this name already exists",
+            "name already exists",
+        )
+    )
+
+
+def create_jira_version(
+    session: requests.Session,
+    jira_url: str,
+    project_id: int,
+    project_key: str,
+    version: str,
+    description: str,
+) -> tuple[str, dict[str, Any] | None]:
+    """Create a Jira release/version."""
+    operation = f"Jira release creation for '{project_key}'"
+
+    response = jira_request(
+        session,
+        "POST",
+        f"{jira_url}/rest/api/3/version",
+        operation,
+        json={
+            "name": version,
+            "description": description,
+            "projectId": project_id,
+            "released": False,
+        },
     )
 
     if response.ok:
+        return "created", json_object(response, operation)
 
-        release = response.json()
+    if is_duplicate_version(response):
+        LOGGER.warning(
+            "Release '%s' already exists in Jira project '%s'. "
+            "Skipping this project and continuing.",
+            version,
+            project_key,
+        )
+        return "exists", None
 
-        print("Release created successfully!")
-        print(f"Project: {project_key}")
-        print(f"Release name: {release.get('name')}")
-        print(f"Release ID: {release.get('id')}")
-        print(f"Description: {release.get('description')}")
+    log_api_error(response, operation)
+    response.raise_for_status()
 
-    else:
+    raise RuntimeError("Unexpected Jira API response.")
 
-        print(
-            f"Failed to create Release in "
-            f"project {project_key}."
+
+def build_release_description(
+    environment: dict[str, str],
+) -> str:
+    """Build the Jira release description."""
+    return "_".join(
+        (
+            environment["VERSION"],
+            environment["TAG"],
+            environment["ENVIRONMENT"],
+            environment["REPOSITORY"],
+            environment["WORKFLOW"],
+        )
+    )
+
+
+def process_project(
+    session: requests.Session,
+    jira_url: str,
+    project_key: str,
+    version: str,
+    description: str,
+) -> str:
+    """Create a release for one Jira project."""
+    LOGGER.info(
+        "Creating release in Jira project: %s",
+        project_key,
+    )
+
+    project = get_jira_project(
+        session,
+        jira_url,
+        project_key,
+    )
+
+    try:
+        project_id = int(project["id"])
+    except KeyError as exc:
+        raise ValueError(
+            f"Jira project '{project_key}' response does not contain "
+            "a project ID."
+        ) from exc
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid Jira project ID '{project.get('id')}' "
+            f"for project '{project_key}'."
+        ) from exc
+
+    LOGGER.info(
+        "Jira project: %s | key: %s | ID: %s",
+        project.get("name", "Unknown"),
+        project.get("key", project_key),
+        project_id,
+    )
+
+    status, release = create_jira_version(
+        session=session,
+        jira_url=jira_url,
+        project_id=project_id,
+        project_key=project_key,
+        version=version,
+        description=description,
+    )
+
+    if status == "exists":
+        return status
+
+    if release is None:
+        raise ValueError(
+            f"Jira release response for project '{project_key}' "
+            "did not contain release data."
         )
 
-        print(response.text)
-        sys.exit(1)
+    LOGGER.info(
+        "Release created successfully | project: %s | name: %s | ID: %s",
+        project_key,
+        release.get("name", version),
+        release.get("id", "Unknown"),
+    )
+
+    return "created"
 
 
-print("")
-print("========================================")
-print("All Jira Releases created successfully!")
-print("========================================")
+def log_configuration(
+    environment: dict[str, str],
+    projects: list[str],
+    description: str,
+) -> None:
+    """Log release configuration."""
+    LOGGER.info(
+        "Release configuration | repository=%s | version=%s | "
+        "tag=%s | environment=%s | workflow=%s | projects=%s",
+        environment["REPOSITORY"],
+        environment["VERSION"],
+        environment["TAG"],
+        environment["ENVIRONMENT"],
+        environment["WORKFLOW"],
+        ", ".join(projects),
+    )
+    LOGGER.info(
+        "Release description: %s",
+        description,
+    )
+
+
+def main() -> int:
+    """Run the Jira release creation process."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s: %(message)s",
+    )
+
+    try:
+        environment = load_environment()
+        config = load_configuration(CONFIG_FILE)
+
+        projects = get_jira_projects(
+            config,
+            environment["REPOSITORY"],
+        )
+
+        description = build_release_description(environment)
+
+        log_configuration(
+            environment,
+            projects,
+            description,
+        )
+
+        session = create_jira_session(
+            environment["JIRA_EMAIL"],
+            environment["JIRA_API_TOKEN"],
+        )
+
+        created: list[str] = []
+        existing: list[str] = []
+
+        for project in projects:
+            status = process_project(
+                session,
+                environment["JIRA_URL"],
+                project,
+                environment["VERSION"],
+                description,
+            )
+
+            if status == "created":
+                created.append(project)
+            else:
+                existing.append(project)
+
+        LOGGER.info(
+            "Release processing completed | created=%s | already_exists=%s",
+            ", ".join(created) or "None",
+            ", ".join(existing) or "None",
+        )
+
+        return 0
+
+    except FileNotFoundError as exc:
+        LOGGER.error("%s", exc)
+
+    except ValueError as exc:
+        LOGGER.error("%s", exc)
+
+    except yaml.YAMLError:
+        LOGGER.error(
+            "The central Jira configuration contains invalid YAML."
+        )
+
+    except requests.HTTPError as exc:
+        LOGGER.error(
+            "Jira API request failed: %s",
+            exc,
+        )
+
+    except requests.RequestException as exc:
+        LOGGER.error(
+            "Jira API connection failed: %s",
+            exc,
+        )
+
+    except KeyboardInterrupt:
+        LOGGER.error("Process interrupted by user.")
+        return 130
+
+    except Exception:
+        LOGGER.exception(
+            "Unexpected error while creating Jira releases."
+        )
+
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
